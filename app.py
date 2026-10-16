@@ -28,7 +28,7 @@ st.title("📦 Analiza vremena zaprimanja robe")
 st.caption("Analiza po jedinstvenom dokumentu ulaza — artikli se ne broje zasebno.")
 
 REQUIRED = ["Datum narudžbe", "Datum kalkulacije", "Naziv dobavljača",
-            "Broj dokumenta ulaza", "Dokument ulaza"]
+            "Broj dokumenta ulaza", "Dokument ulaza", "Skladište"]
 BUCKETS = ["0 dana", "1 dan", "2 dana", "3–5 dana", "Više od 5 dana"]
 
 # Hrvatski državni blagdani i neradni dani. Pomakljivi blagdani računaju se za svaku godinu.
@@ -83,24 +83,24 @@ def load_and_process(file):
     data["Naziv dobavljača"] = data["Naziv dobavljača"].astype("string").str.strip()
     data["Dokument ulaza"] = data["Dokument ulaza"].astype("string").str.strip()
     data["Broj dokumenta ulaza"] = data["Broj dokumenta ulaza"].astype("string").str.replace(r"\.0$", "", regex=True).str.strip()
+    data["Skladište"] = data["Skladište"].astype("string").str.strip()
 
     valid_key = (
+        data["Skladište"].notna() & data["Skladište"].ne("") &
         data["Naziv dobavljača"].notna() & data["Naziv dobavljača"].ne("") &
         data["Broj dokumenta ulaza"].notna() & data["Broj dokumenta ulaza"].ne("") &
         data["Dokument ulaza"].notna() & data["Dokument ulaza"].ne("")
     )
     missing_dates = data["Datum narudžbe"].isna() | data["Datum kalkulacije"].isna()
-    invalid_dates = data["Datum narudžbe"].notna() & data["Datum kalkulacije"].notna() & (
-        data["Datum kalkulacije"] < data["Datum narudžbe"]
-    )
 
     data["_razlog"] = ""
-    data.loc[~valid_key, "_razlog"] = "Nedostaje dobavljač ili ključ dokumenta"
+    data.loc[~valid_key, "_razlog"] = "Nedostaje skladište, dobavljač ili ključ dokumenta"
     data.loc[valid_key & missing_dates, "_razlog"] = "Nedostaje ili nije prepoznat datum narudžbe/kalkulacije"
-    data.loc[valid_key & ~missing_dates & invalid_dates, "_razlog"] = "Datum kalkulacije je prije datuma narudžbe"
 
-    key_cols = ["Naziv dobavljača", "Broj dokumenta ulaza", "Dokument ulaza"]
-    valid_rows = data[valid_key & ~missing_dates & ~invalid_dates].copy()
+    # Ključ sada obavezno uključuje i Skladište
+    key_cols = ["Skladište", "Naziv dobavljača", "Broj dokumenta ulaza", "Dokument ulaza"]
+    valid_rows = data[valid_key & ~missing_dates].copy()
+    
     conflicts = valid_rows.groupby(key_cols, dropna=False).agg(
         broj_datuma_narudzbe=("Datum narudžbe", "nunique"),
         broj_datuma_kalkulacije=("Datum kalkulacije", "nunique"),
@@ -114,7 +114,7 @@ def load_and_process(file):
     if len(conflict_keys):
         conflict_mask = conflict_index.isin(bad_conflict_index)
         conflict_rows = valid_rows.loc[conflict_mask].copy()
-        conflict_rows["_razlog"] = "Isti dokument ima različite datume na redovima artikala"
+        conflict_rows["_razlog"] = "Isti dokument u istom skladištu ima različite datume na redovima artikala"
         valid_rows = valid_rows.loc[~conflict_mask].copy()
     else:
         conflict_rows = valid_rows.iloc[0:0].copy()
@@ -200,7 +200,7 @@ def pdf_summary(summary, total_docs, avg_days, supplier_count, date_from, date_t
 
 uploaded = st.file_uploader("Učitaj Excel datoteku (.xlsx)", type=["xlsx"])
 if uploaded is None:
-    st.info("Učitaj Excel datoteku s obaveznim stupcima: Naziv dobavljača, Broj dokumenta ulaza, Dokument ulaza, Datum narudžbe i Datum kalkulacije.")
+    st.info("Učitaj Excel datoteku s obaveznim stupcima: Skladište, Naziv dobavljača, Broj dokumenta ulaza, Dokument ulaza, Datum narudžbe i Datum kalkulacije.")
     st.stop()
 
 try:
@@ -210,10 +210,14 @@ except Exception as e:
     st.stop()
 
 st.sidebar.header("Filteri")
-suppliers_all = sorted(docs["Naziv dobavljača"].dropna().unique().tolist()) if not docs.empty else []
+warehouses_all = sorted(docs["Skladište"].dropna().unique().tolist()) if not docs.empty else []
+selected_warehouses = st.sidebar.multiselect("Skladište", warehouses_all, default=warehouses_all)
+
+suppliers_all = sorted(docs[docs["Skladište"].isin(selected_warehouses)]["Naziv dobavljača"].dropna().unique().tolist()) if not docs.empty else []
 selected_suppliers = st.sidebar.multiselect("Dobavljač", suppliers_all, default=suppliers_all)
 categories = st.sidebar.multiselect("Vrijeme zaprimanja", BUCKETS, default=BUCKETS)
-filtered = docs[docs["Naziv dobavljača"].isin(selected_suppliers) & docs["Kategorija"].isin(categories)].copy()
+
+filtered = docs[docs["Skladište"].isin(selected_warehouses) & docs["Naziv dobavljača"].isin(selected_suppliers) & docs["Kategorija"].isin(categories)].copy()
 
 total = len(filtered)
 avg_days = float(filtered["Radnih dana"].mean()) if total else 0.0
@@ -263,9 +267,9 @@ st.download_button("⬇️ Preuzmi izvještaj po dobavljaču (Excel)",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 st.subheader("Detalji po dokumentu")
-st.caption("Jedan red po kombinaciji dobavljača i dokumenta ulaza.")
+st.caption("Jedan red po kombinaciji skladišta, dobavljača i dokumenta ulaza.")
 st.dataframe(filtered, use_container_width=True, hide_index=True)
-detail_cols = ["Naziv dobavljača", "Broj dokumenta ulaza", "Dokument ulaza",
+detail_cols = ["Skladište", "Naziv dobavljača", "Broj dokumenta ulaza", "Dokument ulaza",
                "Datum narudžbe", "Datum kalkulacije", "Radnih dana", "Kategorija"]
 st.download_button("⬇️ Preuzmi detalje po dokumentu (Excel)",
                    data=excel_bytes({"Dokumenti": filtered[detail_cols]}),
