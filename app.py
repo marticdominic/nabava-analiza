@@ -10,6 +10,18 @@ from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, PageBreak
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+
+# Registracija fontova s podrškom za hrvatska slova
+try:
+    pdfmetrics.registerFont(TTFont('DejaVuSans', 'DejaVuSans.ttf'))
+    pdfmetrics.registerFont(TTFont('DejaVuSans-Bold', 'DejaVuSans-Bold.ttf'))
+    FONT_REGULAR = 'DejaVuSans'
+    FONT_BOLD = 'DejaVuSans-Bold'
+except Exception:
+    FONT_REGULAR = 'Helvetica'
+    FONT_BOLD = 'Helvetica-Bold'
 
 st.set_page_config(page_title="Analiza zaprimanja robe", page_icon="📦", layout="wide")
 st.title("📦 Analiza vremena zaprimanja robe")
@@ -100,7 +112,6 @@ def load_and_process(file):
     conflict_index = pd.MultiIndex.from_frame(valid_rows[key_cols])
     bad_conflict_index = pd.MultiIndex.from_frame(conflict_keys.reset_index()[key_cols]) if len(conflict_keys) else None
     if len(conflict_keys):
-        # Ne biramo nasumično datum za dokument s proturječnim datumima; šaljemo ga na provjeru.
         conflict_mask = conflict_index.isin(bad_conflict_index)
         conflict_rows = valid_rows.loc[conflict_mask].copy()
         conflict_rows["_razlog"] = "Isti dokument ima različite datume na redovima artikala"
@@ -129,7 +140,6 @@ def load_and_process(file):
     unique_docs["Datum narudžbe"] = unique_docs["Datum narudžbe"].dt.date
     unique_docs["Datum kalkulacije"] = unique_docs["Datum kalkulacije"].dt.date
 
-    # Neobrađeni podaci: neispravni redovi + svi retci artikala za dokumente s konfliktnim datumima.
     invalid_rows = data[data["_razlog"] != ""].copy()
     invalid_rows = pd.concat([invalid_rows, conflict_rows], ignore_index=True)
     invalid_rows = invalid_rows.drop_duplicates(subset=["_izvorni_redak"], keep="first")
@@ -152,16 +162,19 @@ def pdf_summary(summary, total_docs, avg_days, supplier_count, date_from, date_t
     doc = SimpleDocTemplate(output, pagesize=landscape(A4), rightMargin=15*mm,
                             leftMargin=15*mm, topMargin=13*mm, bottomMargin=13*mm)
     styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="TitleHR", parent=styles["Title"], alignment=TA_CENTER, fontSize=18, leading=22))
-    styles.add(ParagraphStyle(name="SmallHR", parent=styles["BodyText"], fontSize=8, leading=10))
+    
+    styles.add(ParagraphStyle(name="TitleHR", parent=styles["Title"], fontName=FONT_BOLD, alignment=TA_CENTER, fontSize=18, leading=22))
+    styles.add(ParagraphStyle(name="BodyHR", parent=styles["Normal"], fontName=FONT_REGULAR))
+    styles.add(ParagraphStyle(name="SmallHR", parent=styles["BodyText"], fontName=FONT_REGULAR, fontSize=8, leading=10))
+    
     story = [
         Paragraph("Ukupni pregled vremena zaprimanja robe", styles["TitleHR"]),
         Spacer(1, 5*mm),
         Paragraph(f"Broj jedinstvenih dokumenata: <b>{total_docs}</b> &nbsp;&nbsp; "
                   f"Prosječno radnih dana: <b>{avg_days:.2f}</b> &nbsp;&nbsp; "
-                  f"Broj dobavljača: <b>{supplier_count}</b>", styles["Normal"]),
+                  f"Broj dobavljača: <b>{supplier_count}</b>", styles["BodyHR"]),
         Spacer(1, 2*mm),
-        Paragraph(f"Razdoblje podataka: {date_from} – {date_to}", styles["Normal"]),
+        Paragraph(f"Razdoblje podataka: {date_from} – {date_to}", styles["BodyHR"]),
         Spacer(1, 6*mm),
     ]
     table_data = [["Kategorija", "Broj dokumenata", "Udio (%)"]]
@@ -171,7 +184,8 @@ def pdf_summary(summary, total_docs, avg_days, supplier_count, date_from, date_t
     table.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#24476B")),
         ("TEXTCOLOR", (0,0), (-1,0), colors.white),
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTNAME", (0,0), (-1,0), FONT_BOLD),
+        ("FONTNAME", (0,1), (-1,-1), FONT_REGULAR),
         ("FONTSIZE", (0,0), (-1,-1), 10),
         ("GRID", (0,0), (-1,-1), 0.4, colors.HexColor("#B7C4D0")),
         ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F1F5F9")]),
