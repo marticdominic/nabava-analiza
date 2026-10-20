@@ -28,7 +28,7 @@ st.title("📦 Analiza vremena zaprimanja robe")
 st.caption("Analiza po jedinstvenom dokumentu ulaza — artikli se ne broje zasebno.")
 
 REQUIRED = ["Datum narudžbe", "Datum kalkulacije", "Naziv dobavljača",
-            "Broj dokumenta ulaza", "Dokument ulaza", "Skladište"]
+            "Broj dokumenta ulaza", "Dokument ulaza", "Skladište", "Artikl"]
 BUCKETS = ["0 dana", "1 dan", "2 dana", "3–5 dana", "Više od 5 dana"]
 
 # Hrvatski državni blagdani i neradni dani. Pomakljivi blagdani računaju se za svaku godinu.
@@ -72,11 +72,13 @@ def all_croatian_holidays(years):
 
 def load_and_process(file):
     raw = pd.read_excel(file)
+    
+    # Ako u obaveznim stupcima nedostaje "Artikl" (jer stariji izvještaji možda imaju samo osnovne), provjeri
     missing_columns = [c for c in REQUIRED if c not in raw.columns]
     if missing_columns:
         raise ValueError("U datoteci nedostaju obavezni stupci: " + ", ".join(missing_columns))
 
-    data = raw[REQUIRED].copy()
+    data = raw.copy()
     data["_izvorni_redak"] = np.arange(2, len(data) + 2)
     data["Datum narudžbe"] = pd.to_datetime(data["Datum narudžbe"], errors="coerce").dt.normalize()
     data["Datum kalkulacije"] = pd.to_datetime(data["Datum kalkulacije"], errors="coerce").dt.normalize()
@@ -84,6 +86,7 @@ def load_and_process(file):
     data["Dokument ulaza"] = data["Dokument ulaza"].astype("string").str.strip()
     data["Broj dokumenta ulaza"] = data["Broj dokumenta ulaza"].astype("string").str.replace(r"\.0$", "", regex=True).str.strip()
     data["Skladište"] = data["Skladište"].astype("string").str.strip()
+    data["Artikl"] = data["Artikl"].astype("string").str.strip()
 
     valid_key = (
         data["Skladište"].notna() & data["Skladište"].ne("") &
@@ -97,7 +100,6 @@ def load_and_process(file):
     data.loc[~valid_key, "_razlog"] = "Nedostaje skladište, dobavljač ili ključ dokumenta"
     data.loc[valid_key & missing_dates, "_razlog"] = "Nedostaje ili nije prepoznat datum narudžbe/kalkulacije"
 
-    # Ključ sada obavezno uključuje i Skladište
     key_cols = ["Skladište", "Naziv dobavljača", "Broj dokumenta ulaza", "Dokument ulaza"]
     valid_rows = data[valid_key & ~missing_dates].copy()
     
@@ -119,7 +121,20 @@ def load_and_process(file):
     else:
         conflict_rows = valid_rows.iloc[0:0].copy()
 
-    unique_docs = valid_rows.drop_duplicates(subset=key_cols, keep="first").copy()
+    # Agregacija jedinstvenih dokumenata uz praćenje broja artikala po dokumentu
+    agg_dict = {
+        "Datum narudžbe": "first",
+        "Datum kalkulacije": "first",
+        "Artikl": "count"  # Broj redaka/artikala unutar te primke
+    }
+    # Zadržavamo i ostale eventualne stupce ako postoje u raw
+    for col in valid_rows.columns:
+        if col not in key_cols and col not in agg_dict and col != "_izvorni_redak":
+            agg_dict[col] = "first"
+
+    unique_docs = valid_rows.groupby(key_cols, as_index=False).agg(agg_dict)
+    unique_docs = unique_docs.rename(columns={"Artikl": "Broj artikala"})
+
     years = set()
     for col in ["Datum narudžbe", "Datum kalkulacije"]:
         years.update(unique_docs[col].dropna().dt.year.astype(int).tolist())
@@ -146,7 +161,7 @@ def load_and_process(file):
     invalid_rows["Datum narudžbe"] = invalid_rows["Datum narudžbe"].apply(lambda x: x.date() if pd.notna(x) else None)
     invalid_rows["Datum kalkulacije"] = invalid_rows["Datum kalkulacije"].apply(lambda x: x.date() if pd.notna(x) else None)
     invalid_rows = invalid_rows.drop(columns=["_izvorni_redak"], errors="ignore")
-    unique_docs = unique_docs.drop(columns=["_izvorni_redak", "_razlog"], errors="ignore")
+    unique_docs = unique_docs.drop(columns=["_izvorni_redak"], errors="ignore")
     return raw, unique_docs, invalid_rows, holidays
 
 def excel_bytes(sheets):
@@ -200,7 +215,7 @@ def pdf_summary(summary, total_docs, avg_days, supplier_count, date_from, date_t
 
 uploaded = st.file_uploader("Učitaj Excel datoteku (.xlsx)", type=["xlsx"])
 if uploaded is None:
-    st.info("Učitaj Excel datoteku s obaveznim stupcima: Skladište, Naziv dobavljača, Broj dokumenta ulaza, Dokument ulaza, Datum narudžbe i Datum kalkulacije.")
+    st.info("Učitaj Excel datoteku s obaveznim stupcima: Skladište, Naziv dobavljača, Broj dokumenta ulaza, Dokument ulaza, Artikl, Datum narudžbe i Datum kalkulacije.")
     st.stop()
 
 try:
@@ -222,11 +237,36 @@ filtered = docs[docs["Skladište"].isin(selected_warehouses) & docs["Naziv dobav
 total = len(filtered)
 avg_days = float(filtered["Radnih dana"].mean()) if total else 0.0
 within_one = float((filtered["Radnih dana"] <= 1).mean() * 100) if total else 0.0
+
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Jedinstvenih dokumenata", f"{total:,}".replace(",", "."))
 c2.metric("Prosječno radnih dana", f"{avg_days:.2f}".replace(".", ","))
 c3.metric("Zaprimljeno u 0–1 dan", f"{within_one:.1f}%".replace(".", ","))
-c4.metric("Broj dobavljača", f"{filtered['Naziv dobavljača'].nunique() if total else 0:,}".replace(",", "."))
+c4.metric("Broj dobavljača", f"{filtered['Naziv dobavljača'].nunique() if total else 0:,}".replace(".", "."))
+
+# --- NOVI DIO: Izračun dnevnog prosjeka artikala i primki po radnim danima ---
+if total > 0:
+    min_date = pd.to_datetime(filtered["Datum kalkulacije"]).min()
+    max_date = pd.to_datetime(filtered["Datum kalkulacije"]).max()
+    holiday_np = np.array(holidays, dtype="datetime64[D]") if holidays else np.array([], dtype="datetime64[D]")
+    # Ukupno radnih dana u odabranom rasponu kalkulacija (uključujući početni i krajnji dan)
+    working_days_count = int(np.busday_count(min_date.strftime('%Y-%m-%d'), (max_date + pd.Timedelta(days=1)).strftime('%Y-%m-%d'), holidays=holiday_np))
+    if working_days_count < 1:
+        working_days_count = 1
+
+    total_articles = int(filtered["Broj artikala"].sum())
+    avg_articles_per_day = total_articles / working_days_count
+    avg_docs_per_day = total / working_days_count
+
+    st.markdown("---")
+    st.subheader("📊 Dnevni prosjek zaprimanja (po radnim danima)")
+    st.caption(f"Raspon datuma kalkulacija: **{min_date.strftime('%d.%m.%Y.')} – {max_date.strftime('%d.%m.%Y.')}** (ukupno **{working_days_count}** radnih dana)")
+    
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Prosječno artikala dnevno", f"{avg_articles_per_day:.1f}".replace(".", ","), help="Ukupan broj zaprimljenih artikala podijeljen s brojem radnih dana")
+    m2.metric("Prosječno primki dnevno", f"{avg_docs_per_day:.1f}".replace(".", ","), help="Ukupan broj jedinstvenih dokumenata ulaza podijeljen s brojem radnih dana")
+    m3.metric("Ukupno zaprimljenih artikala", f"{total_articles:,}".replace(",", "."))
+# --------------------------------------------------------------------------
 
 st.subheader("Ukupni pregled po vremenu zaprimanja")
 counts = filtered["Kategorija"].value_counts().reindex(BUCKETS, fill_value=0) if total else pd.Series(0, index=BUCKETS)
@@ -270,7 +310,7 @@ st.subheader("Detalji po dokumentu")
 st.caption("Jedan red po kombinaciji skladišta, dobavljača i dokumenta ulaza.")
 st.dataframe(filtered, use_container_width=True, hide_index=True)
 detail_cols = ["Skladište", "Naziv dobavljača", "Broj dokumenta ulaza", "Dokument ulaza",
-               "Datum narudžbe", "Datum kalkulacije", "Radnih dana", "Kategorija"]
+               "Datum narudžbe", "Datum kalkulacije", "Broj artikala", "Radnih dana", "Kategorija"]
 st.download_button("⬇️ Preuzmi detalje po dokumentu (Excel)",
                    data=excel_bytes({"Dokumenti": filtered[detail_cols]}),
                    file_name="detalji_po_dokumentu.xlsx",
