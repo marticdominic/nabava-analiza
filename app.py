@@ -24,14 +24,14 @@ except Exception:
     FONT_BOLD = 'Helvetica-Bold'
 
 st.set_page_config(page_title="Analiza zaprimanja robe", page_icon="📦", layout="wide")
-st.title("📦 Analiza vremena zaprimanja robe")
-st.caption("Analiza po jedinstvenom dokumentu ulaza — artikli se ne broje zasebno.")
+st.title("📦 Analiza vremena zaprimanja robe i artikala")
+st.caption("Analiza po jedinstvenom dokumentu ulaza i analitika zaprimanja po artiklima.")
 
 REQUIRED = ["Datum narudžbe", "Datum kalkulacije", "Naziv dobavljača",
             "Broj dokumenta ulaza", "Dokument ulaza", "Skladište", "Artikl"]
 BUCKETS = ["0 dana", "1 dan", "2 dana", "3–5 dana", "Više od 5 dana"]
 
-# Hrvatski državni blagdani i neradni dani. Pomakljivi blagdani računaju se za svaku godinu.
+# Hrvatski državni blagdani i neradni dani.
 def easter_sunday(year):
     a = year % 19
     b = year // 100
@@ -58,7 +58,7 @@ def croatian_holidays(year):
         date(year, 5, 1),   # Praznik rada
         date(year, 5, 30),  # Dan državnosti
         date(year, 6, 22),  # Dan antifašističke borbe
-        date(year, 8, 5),   # Dan pobjede i domovinske zahvalnosti i Dan hrvatskih branitelja
+        date(year, 8, 5),   # Dan pobjede i domovinske zahvalnosti
         date(year, 8, 15),  # Velika Gospa
         date(year, 11, 1),  # Svi sveti
         date(year, 11, 18), # Dan sjećanja na žrtve Domovinskog rata
@@ -72,8 +72,6 @@ def all_croatian_holidays(years):
 
 def load_and_process(file):
     raw = pd.read_excel(file)
-    
-    # Ako u obaveznim stupcima nedostaje "Artikl" (jer stariji izvještaji možda imaju samo osnovne), provjeri
     missing_columns = [c for c in REQUIRED if c not in raw.columns]
     if missing_columns:
         raise ValueError("U datoteci nedostaju obavezni stupci: " + ", ".join(missing_columns))
@@ -87,6 +85,11 @@ def load_and_process(file):
     data["Broj dokumenta ulaza"] = data["Broj dokumenta ulaza"].astype("string").str.replace(r"\.0$", "", regex=True).str.strip()
     data["Skladište"] = data["Skladište"].astype("string").str.strip()
     data["Artikl"] = data["Artikl"].astype("string").str.strip()
+
+    if "Ulaz (kol)" in data.columns:
+        data["Ulaz (kol)"] = pd.to_numeric(data["Ulaz (kol)"], errors="coerce").fillna(0)
+    else:
+        data["Ulaz (kol)"] = 1
 
     valid_key = (
         data["Skladište"].notna() & data["Skladište"].ne("") &
@@ -121,19 +124,18 @@ def load_and_process(file):
     else:
         conflict_rows = valid_rows.iloc[0:0].copy()
 
-    # Agregacija jedinstvenih dokumenata uz praćenje broja artikala po dokumentu
     agg_dict = {
         "Datum narudžbe": "first",
         "Datum kalkulacije": "first",
-        "Artikl": "count"  # Broj redaka/artikala unutar te primke
+        "Artikl": "count",
+        "Ulaz (kol)": "sum"
     }
-    # Zadržavamo i ostale eventualne stupce ako postoje u raw
     for col in valid_rows.columns:
         if col not in key_cols and col not in agg_dict and col != "_izvorni_redak":
             agg_dict[col] = "first"
 
     unique_docs = valid_rows.groupby(key_cols, as_index=False).agg(agg_dict)
-    unique_docs = unique_docs.rename(columns={"Artikl": "Broj artikala"})
+    unique_docs = unique_docs.rename(columns={"Artikl": "Broj artikala", "Ulaz (kol)": "Ukupna količina dokumenta"})
 
     years = set()
     for col in ["Datum narudžbe", "Datum kalkulacije"]:
@@ -162,7 +164,8 @@ def load_and_process(file):
     invalid_rows["Datum kalkulacije"] = invalid_rows["Datum kalkulacije"].apply(lambda x: x.date() if pd.notna(x) else None)
     invalid_rows = invalid_rows.drop(columns=["_izvorni_redak"], errors="ignore")
     unique_docs = unique_docs.drop(columns=["_izvorni_redak"], errors="ignore")
-    return raw, unique_docs, invalid_rows, holidays
+    
+    return raw, unique_docs, invalid_rows, holidays, valid_rows
 
 def excel_bytes(sheets):
     output = io.BytesIO()
@@ -177,7 +180,6 @@ def pdf_summary(summary, total_docs, avg_days, supplier_count, date_from, date_t
     doc = SimpleDocTemplate(output, pagesize=landscape(A4), rightMargin=15*mm,
                             leftMargin=15*mm, topMargin=13*mm, bottomMargin=13*mm)
     styles = getSampleStyleSheet()
-    
     styles.add(ParagraphStyle(name="TitleHR", parent=styles["Title"], fontName=FONT_BOLD, alignment=TA_CENTER, fontSize=18, leading=22))
     styles.add(ParagraphStyle(name="BodyHR", parent=styles["Normal"], fontName=FONT_REGULAR))
     styles.add(ParagraphStyle(name="SmallHR", parent=styles["BodyText"], fontName=FONT_REGULAR, fontSize=8, leading=10))
@@ -209,7 +211,55 @@ def pdf_summary(summary, total_docs, avg_days, supplier_count, date_from, date_t
         ("BOTTOMPADDING", (0,0), (-1,-1), 7),
     ]))
     story.extend([table, Spacer(1, 6*mm),
-        Paragraph("Radni dani računaju se od datuma nakon narudžbe do datuma kalkulacije, uz izuzimanje subota, nedjelja i službenih blagdana/neradnih dana Republike Hrvatske. Kategorije su međusobno isključive.", styles["SmallHR"])])
+        Paragraph("Radni dani računaju se od datuma nakon narudžbe do datuma kalkulacije, uz izuzimanje subota, nedjelja i službenih blagdana/neradnih dana Republike Hrvatske.", styles["SmallHR"])])
+    doc.build(story)
+    return output.getvalue()
+
+def pdf_top_100_articles(top_df):
+    output = io.BytesIO()
+    doc = SimpleDocTemplate(output, pagesize=landscape(A4), rightMargin=10*mm,
+                            leftMargin=10*mm, topMargin=10*mm, bottomMargin=10*mm)
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="TitleTop", parent=styles["Title"], fontName=FONT_BOLD, alignment=TA_CENTER, fontSize=16, leading=20))
+    styles.add(ParagraphStyle(name="CellText", parent=styles["Normal"], fontName=FONT_REGULAR, fontSize=7, leading=8))
+    styles.add(ParagraphStyle(name="CellHeader", parent=styles["Normal"], fontName=FONT_BOLD, fontSize=8, leading=9, textColor=colors.white))
+
+    story = [
+        Paragraph("Top 100 artikala po ukupno zaprimljenoj količini", styles["TitleTop"]),
+        Spacer(1, 4*mm)
+    ]
+    
+    headers = ["#", "Artikl", "Naziv artikla", "Br. primki", "Uk. kol.", "Q1 kol.", "Q2 kol.", "Q3 kol.", "Q4 kol."]
+    table_data = [[Paragraph(h, styles["CellHeader"]) for h in headers]]
+    
+    for idx, r in enumerate(top_df.itertuples(), 1):
+        naziv = str(r.Naziv_artikla) if pd.notna(r.Naziv_artikla) else ""
+        if len(naziv) > 40:
+            naziv = naziv[:37] + "..."
+        row_data = [
+            Paragraph(str(idx), styles["CellText"]),
+            Paragraph(str(r.Artikl), styles["CellText"]),
+            Paragraph(naziv, styles["CellText"]),
+            Paragraph(str(r.Broj_naručivanja), styles["CellText"]),
+            Paragraph(f"{r.Ukupna_količina:g}", styles["CellText"]),
+            Paragraph(f"{r.Q1_količina:g}", styles["CellText"]),
+            Paragraph(f"{r.Q2_količina:g}", styles["CellText"]),
+            Paragraph(f"{r.Q3_količina:g}", styles["CellText"]),
+            Paragraph(f"{r.Q4_količina:g}", styles["CellText"]),
+        ]
+        table_data.append(row_data)
+
+    col_widths = [10*mm, 28*mm, 100*mm, 20*mm, 22*mm, 22*mm, 22*mm, 22*mm, 22*mm]
+    table = Table(table_data, colWidths=col_widths, repeatRows=1)
+    table.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#24476B")),
+        ("GRID", (0,0), (-1,-1), 0.3, colors.HexColor("#CBD5E1")),
+        ("ROWBACKGROUNDS", (0,1), (-1,-1), [colors.white, colors.HexColor("#F8FAFC")]),
+        ("ALIGN", (3,1), (-1,-1), "RIGHT"),
+        ("TOPPADDING", (0,0), (-1,-1), 3),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 3),
+    ]))
+    story.append(table)
     doc.build(story)
     return output.getvalue()
 
@@ -219,7 +269,7 @@ if uploaded is None:
     st.stop()
 
 try:
-    raw, docs, rejected, holidays = load_and_process(uploaded)
+    raw, docs, rejected, holidays, valid_item_rows = load_and_process(uploaded)
 except Exception as e:
     st.error(f"Ne mogu obraditi datoteku: {e}")
     st.stop()
@@ -242,14 +292,13 @@ c1, c2, c3, c4 = st.columns(4)
 c1.metric("Jedinstvenih dokumenata", f"{total:,}".replace(",", "."))
 c2.metric("Prosječno radnih dana", f"{avg_days:.2f}".replace(".", ","))
 c3.metric("Zaprimljeno u 0–1 dan", f"{within_one:.1f}%".replace(".", ","))
-c4.metric("Broj dobavljača", f"{filtered['Naziv dobavljača'].nunique() if total else 0:,}".replace(".", "."))
+c4.metric("Broj dobavljača", f"{filtered['Naziv dobavljača'].nunique() if total else 0:,}".replace(",", "."))
 
-# --- NOVI DIO: Izračun dnevnog prosjeka artikala i primki po radnim danima ---
+# --- DNEVNI PROSJEK ZAPRIMANJA ---
 if total > 0:
     min_date = pd.to_datetime(filtered["Datum kalkulacije"]).min()
     max_date = pd.to_datetime(filtered["Datum kalkulacije"]).max()
     holiday_np = np.array(holidays, dtype="datetime64[D]") if holidays else np.array([], dtype="datetime64[D]")
-    # Ukupno radnih dana u odabranom rasponu kalkulacija (uključujući početni i krajnji dan)
     working_days_count = int(np.busday_count(min_date.strftime('%Y-%m-%d'), (max_date + pd.Timedelta(days=1)).strftime('%Y-%m-%d'), holidays=holiday_np))
     if working_days_count < 1:
         working_days_count = 1
@@ -263,11 +312,84 @@ if total > 0:
     st.caption(f"Raspon datuma kalkulacija: **{min_date.strftime('%d.%m.%Y.')} – {max_date.strftime('%d.%m.%Y.')}** (ukupno **{working_days_count}** radnih dana)")
     
     m1, m2, m3 = st.columns(3)
-    m1.metric("Prosječno artikala dnevno", f"{avg_articles_per_day:.1f}".replace(".", ","), help="Ukupan broj zaprimljenih artikala podijeljen s brojem radnih dana")
-    m2.metric("Prosječno primki dnevno", f"{avg_docs_per_day:.1f}".replace(".", ","), help="Ukupan broj jedinstvenih dokumenata ulaza podijeljen s brojem radnih dana")
-    m3.metric("Ukupno zaprimljenih artikala", f"{total_articles:,}".replace(",", "."))
-# --------------------------------------------------------------------------
+    m1.metric("Prosječno artikala dnevno", f"{avg_articles_per_day:.1f}".replace(".", ","))
+    m2.metric("Prosječno primki dnevno", f"{avg_docs_per_day:.1f}".replace(".", ","))
+    m3.metric("Ukupno zaprimljenih artikala (stavki)", f"{total_articles:,}".replace(",", "."))
 
+# --- NOVI DIO: ANALITIKA PO ARTIKLIMA (UKUPNO I KVARTALNO) ---
+st.markdown("---")
+st.subheader("📦 Analiza po artiklima")
+
+# Filtriranje pojedinačnih stavki artikala po odabranim skladištima i dobavljačima
+valid_filtered_items = valid_item_rows[
+    valid_item_rows["Skladište"].isin(selected_warehouses) & 
+    valid_item_rows["Naziv dobavljača"].isin(selected_suppliers)
+].copy()
+
+if not valid_filtered_items.empty:
+    valid_filtered_items["Kvartal"] = valid_filtered_items["Datum kalkulacije"].dt.to_period("Q").astype(str)
+
+    # Agregacija ukupno po artiklu
+    art_group = valid_filtered_items.groupby("Artikl").agg(
+        Naziv_artikla=("Naziv artikla", "first") if "Naziv artikla" in valid_filtered_items.columns else ("Artikl", "first"),
+        Broj_naručivanja=("Broj dokumenta ulaza", "count"),
+        Ukupna_količina=("Ulaz (kol)", "sum")
+    ).reset_index()
+
+    # Kvartalna raščlamba po količinama i broju naručivanja
+    q_pivot_qty = valid_filtered_items.pivot_table(index="Artikl", columns="Kvartal", values="Ulaz (kol)", aggfunc="sum", fill_value=0)
+    q_pivot_count = valid_filtered_items.pivot_table(index="Artikl", columns="Kvartal", values="Broj dokumenta ulaza", aggfunc="count", fill_value=0)
+
+    # Dodavanje kvartalnih stupaca u glavni dataframe artikala
+    for q in ["Q1", "Q2", "Q3", "Q4"]:
+        matched_cols_qty = [c for c in q_pivot_qty.columns if q in str(c)]
+        matched_cols_cnt = [c for c in q_pivot_count.columns if q in str(c)]
+        art_group[f"{q}_količina"] = q_pivot_qty[matched_cols_qty].sum(axis=1).reindex(art_group["Artikl"]).values if matched_cols_qty else 0
+        art_group[f"{q}_naručivanja"] = q_pivot_count[matched_cols_cnt].sum(axis=1).reindex(art_group["Artikl"]).values if matched_cols_cnt else 0
+
+    art_group = art_group.sort_values("Ukupna_količina", ascending=False)
+
+    st.dataframe(art_group, use_container_width=True, hide_index=True)
+
+    col_btn1, col_btn2 = st.columns(2)
+    with col_btn1:
+        st.download_button("⬇️ Preuzmi kompletnu analizu artikala (Excel)",
+                           data=excel_bytes({"Artikli_Ukupno_i_Kvartalno": art_group}),
+                           file_name="analiza_artikala_kvartalno.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    
+    with col_btn2:
+        top_100 = art_group.head(100).copy()
+        top_100_pdf = pdf_top_100_articles(top_100)
+        st.download_button("⬇️ Preuzmi Top 100 artikala (PDF)",
+                           data=top_100_pdf,
+                           file_name="top_100_artikala.pdf",
+                           mime="application/pdf")
+
+    # --- IZVJEŠTAJ: ARTIKLI NARUČIVANI OD VIŠE DOBAVLJAČA ---
+    st.markdown("---")
+    st.subheader("🔀 Artikli naručivani od više dobavljača")
+    
+    multi_sup = valid_filtered_items.groupby("Artikl").agg(
+        Naziv_artikla=("Naziv artikla", "first") if "Naziv artikla" in valid_filtered_items.columns else ("Artikl", "first"),
+        Broj_različitih_dobavljača=("Naziv dobavljača", "nunique"),
+        Popis_dobavljača=("Naziv dobavljača", lambda x: ", ".join(sorted(x.unique()))),
+        Broj_naručivanja=("Broj dokumenta ulaza", "count"),
+        Ukupna_količina=("Ulaz (kol)", "sum")
+    ).reset_index()
+
+    multi_sup_filtered = multi_sup[multi_sup["Broj_različitih_dobavljača"] > 1].sort_values("Broj_različitih_dobavljača", ascending=False)
+
+    st.caption(f"Pronađeno **{len(multi_sup_filtered)}** artikala koji su zaprimani od 2 ili više različitih dobavljača.")
+    st.dataframe(multi_sup_filtered, use_container_width=True, hide_index=True)
+
+    st.download_button("⬇️ Preuzmi izvještaj o artiklima od više dobavljača (Excel)",
+                       data=excel_bytes({"Više dobavljača": multi_sup_filtered}),
+                       file_name="artikli_vise_dobavljaca.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# --- OSTALI IZVJEŠTAJI (Kao i ranije) ---
+st.markdown("---")
 st.subheader("Ukupni pregled po vremenu zaprimanja")
 counts = filtered["Kategorija"].value_counts().reindex(BUCKETS, fill_value=0) if total else pd.Series(0, index=BUCKETS)
 summary = pd.DataFrame({"Kategorija": BUCKETS,
@@ -326,14 +448,14 @@ st.download_button("⬇️ Preuzmi neobrađene podatke (Excel)",
                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 with st.expander("Obuhvat hrvatskih blagdana"):
-    st.write("U izračun su uključeni: Nova godina, Bogojavljenje (Sveta tri kralja), Uskrs, Uskrsni ponedjeljak, Praznik rada, Dan državnosti, Dan antifašističke borbe, Tijelovo, Dan pobjede i domovinske zahvalnosti i Dan hrvatskih branitelja, Velika Gospa, Svi sveti, Dan sjećanja na žrtve Domovinskog rata, Božić i Sveti Stjepan.")
+    st.write("U izračun su uključeni: Nova godina, Bogojavljenje (Sveta tri kralja), Uskrs, Uskrsni ponedjeljak, Praznik rada, Dan državnosti, Dan antifašističke borbe, Tijelovo, Dan pobjede i domovinske zahvalnosti, Velika Gospa, Svi sveti, Dan sjećanja na žrtve Domovinskog rata, Božić i Sveti Stjepan.")
     if holidays:
         st.write("Blagdani generirani za godine:", ", ".join(map(str, years)))
         st.dataframe(pd.DataFrame({"Datum": holidays, "Blagdan": [
             next((n for n,d in [
                 ("Nova godina", date(h.year,1,1)), ("Bogojavljenje / Sveta tri kralja", date(h.year,1,6)),
                 ("Praznik rada", date(h.year,5,1)), ("Dan državnosti", date(h.year,5,30)),
-                ("Dan antifašističke borbe", date(h.year,6,22)), ("Dan pobjede i domovinske zahvalnosti i Dan hrvatskih branitelja", date(h.year,8,5)),
+                ("Dan antifašističke borbe", date(h.year,6,22)), ("Dan pobjede i domovinske zahvalnosti", date(h.year,8,5)),
                 ("Velika Gospa", date(h.year,8,15)), ("Svi sveti", date(h.year,11,1)),
                 ("Dan sjećanja na žrtve Domovinskog rata", date(h.year,11,18)), ("Božić", date(h.year,12,25)),
                 ("Sveti Stjepan", date(h.year,12,26)), ("Uskrs", easter_sunday(h.year)),
