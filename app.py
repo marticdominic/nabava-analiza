@@ -163,7 +163,7 @@ def load_and_process(file):
     invalid_rows["Datum narudžbe"] = invalid_rows["Datum narudžbe"].apply(lambda x: x.date() if pd.notna(x) else None)
     invalid_rows["Datum kalkulacije"] = invalid_rows["Datum kalkulacije"].apply(lambda x: x.date() if pd.notna(x) else None)
     invalid_rows = invalid_rows.drop(columns=["_izvorni_redak"], errors="ignore")
-    unique_docs = unique_docs.drop(columns=["_izvorni_redak"], errors="ignore")
+    unique_docs = unique_docs.drop(columns=["_izvorni_redak", "_razlog"], errors="ignore")
     
     return raw, unique_docs, invalid_rows, holidays, valid_rows
 
@@ -215,7 +215,7 @@ def pdf_summary(summary, total_docs, avg_days, supplier_count, date_from, date_t
     doc.build(story)
     return output.getvalue()
 
-def pdf_top_100_articles(top_df):
+def pdf_top_100_articles(top_df, title_text, by_orders=False):
     output = io.BytesIO()
     doc = SimpleDocTemplate(output, pagesize=landscape(A4), rightMargin=10*mm,
                             leftMargin=10*mm, topMargin=10*mm, bottomMargin=10*mm)
@@ -225,27 +225,39 @@ def pdf_top_100_articles(top_df):
     styles.add(ParagraphStyle(name="CellHeader", parent=styles["Normal"], fontName=FONT_BOLD, fontSize=8, leading=9, textColor=colors.white))
 
     story = [
-        Paragraph("Top 100 artikala po ukupno zaprimljenoj količini", styles["TitleTop"]),
+        Paragraph(title_text, styles["TitleTop"]),
         Spacer(1, 4*mm)
     ]
     
-    headers = ["#", "Artikl", "Naziv artikla", "Br. primki", "Uk. kol.", "Q1 kol.", "Q2 kol.", "Q3 kol.", "Q4 kol."]
+    if by_orders:
+        headers = ["#", "Artikl", "Naziv artikla", "Br. primki", "Uk. kol.", "Q1 primki", "Q2 primki", "Q3 primki", "Q4 primki"]
+        q_cols = ["Q1_naručivanja", "Q2_naručivanja", "Q3_naručivanja", "Q4_naručivanja"]
+    else:
+        headers = ["#", "Artikl", "Naziv artikla", "Br. primki", "Uk. kol.", "Q1 kol.", "Q2 kol.", "Q3 kol.", "Q4 kol."]
+        q_cols = ["Q1_količina", "Q2_količina", "Q3_količina", "Q4_količina"]
+
     table_data = [[Paragraph(h, styles["CellHeader"]) for h in headers]]
     
     for idx, r in enumerate(top_df.itertuples(), 1):
         naziv = str(r.Naziv_artikla) if pd.notna(r.Naziv_artikla) else ""
         if len(naziv) > 40:
             naziv = naziv[:37] + "..."
+            
+        val_q1 = getattr(r, q_cols[0])
+        val_q2 = getattr(r, q_cols[1])
+        val_q3 = getattr(r, q_cols[2])
+        val_q4 = getattr(r, q_cols[3])
+
         row_data = [
             Paragraph(str(idx), styles["CellText"]),
             Paragraph(str(r.Artikl), styles["CellText"]),
             Paragraph(naziv, styles["CellText"]),
             Paragraph(str(r.Broj_naručivanja), styles["CellText"]),
             Paragraph(f"{r.Ukupna_količina:g}", styles["CellText"]),
-            Paragraph(f"{r.Q1_količina:g}", styles["CellText"]),
-            Paragraph(f"{r.Q2_količina:g}", styles["CellText"]),
-            Paragraph(f"{r.Q3_količina:g}", styles["CellText"]),
-            Paragraph(f"{r.Q4_količina:g}", styles["CellText"]),
+            Paragraph(f"{val_q1:g}", styles["CellText"]),
+            Paragraph(f"{val_q2:g}", styles["CellText"]),
+            Paragraph(f"{val_q3:g}", styles["CellText"]),
+            Paragraph(f"{val_q4:g}", styles["CellText"]),
         ]
         table_data.append(row_data)
 
@@ -292,7 +304,7 @@ c1, c2, c3, c4 = st.columns(4)
 c1.metric("Jedinstvenih dokumenata", f"{total:,}".replace(",", "."))
 c2.metric("Prosječno radnih dana", f"{avg_days:.2f}".replace(".", ","))
 c3.metric("Zaprimljeno u 0–1 dan", f"{within_one:.1f}%".replace(".", ","))
-c4.metric("Broj dobavljača", f"{filtered['Naziv dobavljača'].nunique() if total else 0:,}".replace(",", "."))
+c4.metric("Broj dobavljača", f"{filtered['Naziv dobavljača'].nunique() if total else 0:,}".replace(".", "."))
 
 # --- DNEVNI PROSJEK ZAPRIMANJA ---
 if total > 0:
@@ -316,11 +328,10 @@ if total > 0:
     m2.metric("Prosječno primki dnevno", f"{avg_docs_per_day:.1f}".replace(".", ","))
     m3.metric("Ukupno zaprimljenih artikala (stavki)", f"{total_articles:,}".replace(",", "."))
 
-# --- NOVI DIO: ANALITIKA PO ARTIKLIMA (UKUPNO I KVARTALNO) ---
+# --- ANALITIKA PO ARTIKLIMA (UKUPNO I KVARTALNO) ---
 st.markdown("---")
 st.subheader("📦 Analiza po artiklima")
 
-# Filtriranje pojedinačnih stavki artikala po odabranim skladištima i dobavljačima
 valid_filtered_items = valid_item_rows[
     valid_item_rows["Skladište"].isin(selected_warehouses) & 
     valid_item_rows["Naziv dobavljača"].isin(selected_suppliers)
@@ -329,18 +340,15 @@ valid_filtered_items = valid_item_rows[
 if not valid_filtered_items.empty:
     valid_filtered_items["Kvartal"] = valid_filtered_items["Datum kalkulacije"].dt.to_period("Q").astype(str)
 
-    # Agregacija ukupno po artiklu
     art_group = valid_filtered_items.groupby("Artikl").agg(
         Naziv_artikla=("Naziv artikla", "first") if "Naziv artikla" in valid_filtered_items.columns else ("Artikl", "first"),
         Broj_naručivanja=("Broj dokumenta ulaza", "count"),
         Ukupna_količina=("Ulaz (kol)", "sum")
     ).reset_index()
 
-    # Kvartalna raščlamba po količinama i broju naručivanja
     q_pivot_qty = valid_filtered_items.pivot_table(index="Artikl", columns="Kvartal", values="Ulaz (kol)", aggfunc="sum", fill_value=0)
     q_pivot_count = valid_filtered_items.pivot_table(index="Artikl", columns="Kvartal", values="Broj dokumenta ulaza", aggfunc="count", fill_value=0)
 
-    # Dodavanje kvartalnih stupaca u glavni dataframe artikala
     for q in ["Q1", "Q2", "Q3", "Q4"]:
         matched_cols_qty = [c for c in q_pivot_qty.columns if q in str(c)]
         matched_cols_cnt = [c for c in q_pivot_count.columns if q in str(c)]
@@ -351,19 +359,28 @@ if not valid_filtered_items.empty:
 
     st.dataframe(art_group, use_container_width=True, hide_index=True)
 
-    col_btn1, col_btn2 = st.columns(2)
-    with col_btn1:
-        st.download_button("⬇️ Preuzmi kompletnu analizu artikala (Excel)",
-                           data=excel_bytes({"Artikli_Ukupno_i_Kvartalno": art_group}),
-                           file_name="analiza_artikala_kvartalno.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.download_button("⬇️ Preuzmi kompletnu analizu artikala (Excel)",
+                       data=excel_bytes({"Artikli_Ukupno_i_Kvartalno": art_group}),
+                       file_name="analiza_artikala_kvartalno.xlsx",
+                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    st.markdown("### 📄 Preuzimanje PDF izvještaja za Top artikle")
+    pdf_col1, pdf_col2 = st.columns(2)
     
-    with col_btn2:
-        top_100 = art_group.head(100).copy()
-        top_100_pdf = pdf_top_100_articles(top_100)
-        st.download_button("⬇️ Preuzmi Top 100 artikala (PDF)",
-                           data=top_100_pdf,
-                           file_name="top_100_artikala.pdf",
+    with pdf_col1:
+        top_100_qty = art_group.sort_values("Ukupna_količina", ascending=False).head(100).copy()
+        pdf_qty_data = pdf_top_100_articles(top_100_qty, "Top 100 artikala po ukupno zaprimljenoj količini", by_orders=False)
+        st.download_button("⬇️ Preuzmi Top 100 po količinama (PDF)",
+                           data=pdf_qty_data,
+                           file_name="top_100_artikala_kolicine.pdf",
+                           mime="application/pdf")
+
+    with pdf_col2:
+        top_100_orders = art_group.sort_values("Broj_naručivanja", ascending=False).head(100).copy()
+        pdf_ord_data = pdf_top_100_articles(top_100_orders, "Top 100 artikala po broju narudžbi (učestalosti)", by_orders=True)
+        st.download_button("⬇️ Preuzmi Top 100 po broju narudžbi (PDF)",
+                           data=pdf_ord_data,
+                           file_name="top_100_artikala_narudzbe.pdf",
                            mime="application/pdf")
 
     # --- IZVJEŠTAJ: ARTIKLI NARUČIVANI OD VIŠE DOBAVLJAČA ---
@@ -388,7 +405,7 @@ if not valid_filtered_items.empty:
                        file_name="artikli_vise_dobavljaca.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# --- OSTALI IZVJEŠTAJI (Kao i ranije) ---
+# --- OSTALI IZVJEŠTAJI ---
 st.markdown("---")
 st.subheader("Ukupni pregled po vremenu zaprimanja")
 counts = filtered["Kategorija"].value_counts().reindex(BUCKETS, fill_value=0) if total else pd.Series(0, index=BUCKETS)
